@@ -1,0 +1,12 @@
+#!/bin/sh
+# Starts AutoCAD 2026.
+# Profile.aws bloats with duplicated <AcApData> blocks during a session (tens
+# of MB in minutes), which makes closing and the next start very slow, so every
+# start begins from a known-good copy saved by setup-launchers.sh.
+: "${AUTOCAD_WINE_HOME:=$HOME/.cache/wine-autocad-build}"
+: "${WINEPREFIX:=$HOME/.wine-autocad}"
+P="$WINEPREFIX/drive_c/users/$USER/AppData/Roaming/Autodesk/AutoCAD 2026/R25.1/enu/Support/Profiles/Unnamed Profile/Profile.aws"
+[ -f "$AUTOCAD_WINE_HOME/Profile.aws.good" ] && cp "$AUTOCAD_WINE_HOME/Profile.aws.good" "$P"
+cd "$WINEPREFIX/drive_c/Program Files/Autodesk/AutoCAD 2026" || exit 1
+mkdir -p "$AUTOCAD_WINE_HOME/logs"
+WINEDEBUG=err+all,fixme-all exec "$AUTOCAD_WINE_HOME/wine-autocad" acad.exe "$@" >"$AUTOCAD_WINE_HOME/logs/autocad-last.log" 2>&1

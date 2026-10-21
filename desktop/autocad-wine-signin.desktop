@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AutoCAD Sign-in (Wine)
+Comment=Passes Autodesk sign-in callbacks to AutoCAD running in Wine
+Exec=@HOME@/adsk-url-handler %u
+MimeType=x-scheme-handler/adskidmgr;x-scheme-handler/adsk.idmgr;
+NoDisplay=true
+Terminal=false

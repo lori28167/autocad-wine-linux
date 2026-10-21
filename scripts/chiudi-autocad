@@ -1,0 +1,6 @@
+#!/bin/sh
+# Force-closes AutoCAD. Unsaved drawings are lost; the profile is reset on next start.
+pkill -9 -x acad.exe
+pkill -9 -f 'msedgewebview2.exe.*webview-exe-name=acad.exe'
+notify-send "AutoCAD" "Chiuso" 2>/dev/null
+exit 0

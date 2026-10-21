@@ -1,0 +1,357 @@
+--- a/dlls/kernelbase/registry.c	2026-10-16 14:02:05.699977047 +0200
++++ b/dlls/kernelbase/registry.c	2026-10-16 14:02:18.579223742 +0200
+@@ -3212,28 +3212,270 @@
+  */
+ LSTATUS WINAPI RegLoadAppKeyA(const char *file, HKEY *result, REGSAM sam, DWORD options, DWORD reserved)
+ {
+-    FIXME("%s %p %lu %lu %lu: stub\n", wine_dbgstr_a(file), result, sam, options, reserved);
++    UNICODE_STRING fileW;
++    LSTATUS ret;
+ 
+-    if (!file || reserved)
+-        return ERROR_INVALID_PARAMETER;
++    if (!file) return ERROR_INVALID_PARAMETER;
++    if (!RtlCreateUnicodeStringFromAsciiz( &fileW, file )) return ERROR_NOT_ENOUGH_MEMORY;
++    ret = RegLoadAppKeyW( fileW.Buffer, result, sam, options, reserved );
++    RtlFreeUnicodeString( &fileW );
++    return ret;
++}
++
++/* Minimal reader for Windows binary registry hives ("regf"), used to back
++ * RegLoadAppKeyW with a private volatile copy of the hive contents. */
++
++struct regf_hive
++{
++    const BYTE *data;  /* start of the first hbin */
++    SIZE_T      size;
++};
++
++static const BYTE *regf_cell( const struct regf_hive *hive, DWORD offset, DWORD *len )
++{
++    LONG cell_size;
++
++    if (offset == 0xffffffff || offset > hive->size || hive->size - offset < sizeof(LONG)) return NULL;
++    cell_size = *(const LONG *)(hive->data + offset);
++    if (cell_size < 0) cell_size = -cell_size;
++    if ((DWORD)cell_size < sizeof(LONG) || (DWORD)cell_size > hive->size - offset) return NULL;
++    if (len) *len = cell_size - sizeof(LONG);
++    return hive->data + offset + sizeof(LONG);
++}
++
++static WCHAR *regf_name( const BYTE *name, DWORD len, BOOL ascii )
++{
++    WCHAR *ret;
++    DWORD i, count = ascii ? len : len / sizeof(WCHAR);
++
++    if (!(ret = HeapAlloc( GetProcessHeap(), 0, (count + 1) * sizeof(WCHAR) ))) return NULL;
++    if (ascii) for (i = 0; i < count; i++) ret[i] = name[i];
++    else memcpy( ret, name, count * sizeof(WCHAR) );
++    ret[count] = 0;
++    return ret;
++}
++
++static BYTE *regf_value_data( const struct regf_hive *hive, DWORD size, DWORD offset )
++{
++    const BYTE *cell;
++    DWORD len, done, i, count, list_len;
++    BYTE *ret;
++
++    if (!(ret = HeapAlloc( GetProcessHeap(), 0, size ? size : 1 ))) return NULL;
++    if (!(cell = regf_cell( hive, offset, &len ))) goto fail;
++    if (size > 16344 && len >= 8 && cell[0] == 'd' && cell[1] == 'b')
++    {
++        const DWORD *list;
++        count = *(const WORD *)(cell + 2);
++        if (!(list = (const DWORD *)regf_cell( hive, *(const DWORD *)(cell + 4), &list_len ))) goto fail;
++        if (list_len < count * sizeof(DWORD)) goto fail;
++        for (i = done = 0; i < count && done < size; i++)
++        {
++            const BYTE *seg;
++            DWORD seg_len, chunk;
++            if (!(seg = regf_cell( hive, list[i], &seg_len ))) goto fail;
++            chunk = min( min( seg_len, 16344 ), size - done );
++            memcpy( ret + done, seg, chunk );
++            done += chunk;
++        }
++        if (done != size) goto fail;
++        return ret;
++    }
++    if (len < size) goto fail;
++    memcpy( ret, cell, size );
++    return ret;
++fail:
++    HeapFree( GetProcessHeap(), 0, ret );
++    return NULL;
++}
++
++static NTSTATUS regf_load_key( const struct regf_hive *hive, DWORD nk_offset, HANDLE key, int depth );
++
++static NTSTATUS regf_load_subkey( const struct regf_hive *hive, DWORD nk_offset, HANDLE parent, int depth )
++{
++    const BYTE *nk;
++    DWORD len, name_len;
++    UNICODE_STRING nameW;
++    OBJECT_ATTRIBUTES attr;
++    HANDLE subkey;
++    WCHAR *name;
++    NTSTATUS status;
++
++    if (!(nk = regf_cell( hive, nk_offset, &len )) || len < 0x4c || nk[0] != 'n' || nk[1] != 'k')
++        return STATUS_REGISTRY_CORRUPT;
++    name_len = *(const WORD *)(nk + 0x48);
++    if (name_len > len - 0x4c) return STATUS_REGISTRY_CORRUPT;
++    if (!(name = regf_name( nk + 0x4c, name_len, *(const WORD *)(nk + 2) & 0x20 ))) return STATUS_NO_MEMORY;
+ 
+-    *result = (HKEY)0xdeadbeef;
+-    return ERROR_SUCCESS;
++    RtlInitUnicodeString( &nameW, name );
++    InitializeObjectAttributes( &attr, &nameW, 0, parent, NULL );
++    status = NtCreateKey( &subkey, KEY_ALL_ACCESS, &attr, 0, NULL, REG_OPTION_VOLATILE, NULL );
++    HeapFree( GetProcessHeap(), 0, name );
++    if (status) return status;
++    status = regf_load_key( hive, nk_offset, subkey, depth + 1 );
++    NtClose( subkey );
++    return status;
++}
++
++static NTSTATUS regf_load_subkey_list( const struct regf_hive *hive, DWORD list_offset, HANDLE key, int depth )
++{
++    const BYTE *list;
++    DWORD len, count, i, stride;
++    NTSTATUS status;
++
++    if (!(list = regf_cell( hive, list_offset, &len )) || len < 4) return STATUS_REGISTRY_CORRUPT;
++    count = *(const WORD *)(list + 2);
++
++    if ((list[0] == 'l' && (list[1] == 'f' || list[1] == 'h')) || (list[0] == 'l' && list[1] == 'i') ||
++        (list[0] == 'r' && list[1] == 'i'))
++    {
++        stride = (list[1] == 'f' || list[1] == 'h') ? 8 : 4;
++        if (len - 4 < count * stride) return STATUS_REGISTRY_CORRUPT;
++        for (i = 0; i < count; i++)
++        {
++            DWORD offset = *(const DWORD *)(list + 4 + i * stride);
++            if (list[0] == 'r') status = regf_load_subkey_list( hive, offset, key, depth + 1 );
++            else status = regf_load_subkey( hive, offset, key, depth );
++            if (status) return status;
++        }
++        return STATUS_SUCCESS;
++    }
++    return STATUS_REGISTRY_CORRUPT;
++}
++
++static NTSTATUS regf_load_key( const struct regf_hive *hive, DWORD nk_offset, HANDLE key, int depth )
++{
++    const BYTE *nk;
++    const DWORD *values;
++    DWORD len, values_len, i, count;
++    NTSTATUS status;
++
++    if (depth > 512) return STATUS_REGISTRY_CORRUPT;
++    if (!(nk = regf_cell( hive, nk_offset, &len )) || len < 0x4c || nk[0] != 'n' || nk[1] != 'k')
++        return STATUS_REGISTRY_CORRUPT;
++
++    if ((count = *(const DWORD *)(nk + 0x24)))
++    {
++        if (!(values = (const DWORD *)regf_cell( hive, *(const DWORD *)(nk + 0x28), &values_len )) ||
++            values_len < count * sizeof(DWORD))
++            return STATUS_REGISTRY_CORRUPT;
++
++        for (i = 0; i < count; i++)
++        {
++            const BYTE *vk;
++            DWORD vk_len, name_len, size, type;
++            UNICODE_STRING nameW;
++            WCHAR *name;
++            BYTE *data;
++
++            if (!(vk = regf_cell( hive, values[i], &vk_len )) || vk_len < 0x14 || vk[0] != 'v' || vk[1] != 'k')
++                return STATUS_REGISTRY_CORRUPT;
++            name_len = *(const WORD *)(vk + 2);
++            if (name_len > vk_len - 0x14) return STATUS_REGISTRY_CORRUPT;
++            size = *(const DWORD *)(vk + 4);
++            type = *(const DWORD *)(vk + 0x0c);
++
++            if (!(name = regf_name( vk + 0x14, name_len, *(const WORD *)(vk + 0x10) & 1 ))) return STATUS_NO_MEMORY;
++            if (size & 0x80000000)
++            {
++                size &= 0x7fffffff;
++                if (size > 4) size = 4;
++                data = HeapAlloc( GetProcessHeap(), 0, 4 );
++                if (data) memcpy( data, vk + 8, 4 );
++            }
++            else data = regf_value_data( hive, size, *(const DWORD *)(vk + 8) );
++
++            if (!data)
++            {
++                HeapFree( GetProcessHeap(), 0, name );
++                return STATUS_REGISTRY_CORRUPT;
++            }
++            RtlInitUnicodeString( &nameW, name );
++            status = NtSetValueKey( key, &nameW, 0, type, data, size );
++            HeapFree( GetProcessHeap(), 0, data );
++            HeapFree( GetProcessHeap(), 0, name );
++            if (status) return status;
++        }
++    }
++
++    if (*(const DWORD *)(nk + 0x14))
++        return regf_load_subkey_list( hive, *(const DWORD *)(nk + 0x1c), key, depth );
++    return STATUS_SUCCESS;
+ }
+ 
+ /******************************************************************************
+  * RegLoadAppKeyW (kernelbase.@)
+  *
++ * Wine has no support for mounting binary hives, so the hive is parsed here
++ * and copied into a private volatile key that the caller gets a handle to.
+  */
+ LSTATUS WINAPI RegLoadAppKeyW(const WCHAR *file, HKEY *result, REGSAM sam, DWORD options, DWORD reserved)
+ {
+-    FIXME("%s %p %lu %lu %lu: stub\n", wine_dbgstr_w(file), result, sam, options, reserved);
++    static LONG counter;
++    WCHAR path[128];
++    UNICODE_STRING pathW;
++    OBJECT_ATTRIBUTES attr;
++    struct regf_hive hive;
++    LARGE_INTEGER file_size;
++    HANDLE handle, key = NULL;
++    BYTE *buffer = NULL;
++    DWORD read;
++    NTSTATUS status;
++    LSTATUS ret;
+ 
+-    if (!file || reserved)
++    TRACE("%s %p %#lx %#lx %#lx\n", wine_dbgstr_w(file), result, sam, options, reserved);
++
++    if (!file || !result || reserved)
+         return ERROR_INVALID_PARAMETER;
+ 
+-    *result = (HKEY)0xdeadbeef;
+-    return ERROR_SUCCESS;
++    handle = CreateFileW( file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
++                          OPEN_EXISTING, 0, NULL );
++    if (handle == INVALID_HANDLE_VALUE) return GetLastError();
++    if (!GetFileSizeEx( handle, &file_size ) || file_size.QuadPart < 0x1000 + 0x20 ||
++        file_size.QuadPart > 0x40000000 ||
++        !(buffer = HeapAlloc( GetProcessHeap(), 0, file_size.QuadPart )) ||
++        !ReadFile( handle, buffer, file_size.QuadPart, &read, NULL ) || read != file_size.QuadPart)
++    {
++        ret = buffer ? ERROR_BADDB : ERROR_NOT_ENOUGH_MEMORY;
++        goto done;
++    }
++    if (memcmp( buffer, "regf", 4 ))
++    {
++        ret = ERROR_BADDB;
++        goto done;
++    }
++
++    hive.data = buffer + 0x1000;
++    hive.size = file_size.QuadPart - 0x1000;
++
++    InitializeObjectAttributes( &attr, &pathW, OBJ_CASE_INSENSITIVE, 0, NULL );
++    RtlInitUnicodeString( &pathW, L"\\Registry\\Machine\\Software\\Wine\\AppKeys" );
++    if (!(status = NtCreateKey( &key, KEY_ALL_ACCESS, &attr, 0, NULL, REG_OPTION_VOLATILE, NULL )))
++        NtClose( key );
++    swprintf( path, ARRAY_SIZE(path), L"\\Registry\\Machine\\Software\\Wine\\AppKeys\\%04lx-%08lx-%lu",
++              GetCurrentProcessId(), GetTickCount(), InterlockedIncrement( &counter ) );
++    RtlInitUnicodeString( &pathW, path );
++    if ((status = NtCreateKey( &key, KEY_ALL_ACCESS, &attr, 0, NULL, REG_OPTION_VOLATILE, NULL )))
++    {
++        ret = RtlNtStatusToDosError( status );
++        goto done;
++    }
++
++    if ((status = regf_load_key( &hive, *(const DWORD *)(buffer + 0x24), key, 0 )))
++    {
++        WARN( "failed to load hive %s: %#lx\n", wine_dbgstr_w(file), status );
++        NtDeleteKey( key );
++        NtClose( key );
++        ret = RtlNtStatusToDosError( status );
++        goto done;
++    }
++
++    *result = key;
++    ret = ERROR_SUCCESS;
++done:
++    HeapFree( GetProcessHeap(), 0, buffer );
++    CloseHandle( handle );
++    return ret;
+ }
+ 
+ 
+--- a/server/process.c	2026-10-16 14:24:28.298862639 +0200
++++ b/server/process.c	2026-10-16 14:24:39.780991415 +0200
+@@ -1980,6 +1980,19 @@
+     }
+ }
+ 
++/* services.exe runs in session 0 on Windows; programs such as the Go and .NET
++ * runtimes check this to detect whether they were started as a service */
++static unsigned int get_reported_session_id( const struct process *process )
++{
++    static const WCHAR services_exeW[] = {'\\','s','e','r','v','i','c','e','s','.','e','x','e'};
++    data_size_t len = sizeof(services_exeW);
++
++    if (process->image && process->imagelen >= len &&
++        !memicmp_strW( process->image + (process->imagelen - len) / sizeof(WCHAR), services_exeW, len ))
++        return 0;
++    return process->session_id;
++}
++
+ /* Get a list of processes and threads currently running */
+ DECL_HANDLER(list_processes)
+ {
+@@ -2025,7 +2038,7 @@
+         process_info->priority = process->priority;
+         process_info->pid = process->id;
+         process_info->parent_pid = process->parent_id;
+-        process_info->session_id = process->session_id;
++        process_info->session_id = get_reported_session_id( process );
+         process_info->handle_count = get_handle_table_count(process);
+         process_info->unix_pid = process->unix_pid;
+         pos += sizeof(*process_info);
+--- a/dlls/ole32/ole2.c	2026-10-16 14:42:59.714767931 +0200
++++ b/dlls/ole32/ole2.c	2026-10-16 14:42:59.722101087 +0200
+@@ -46,6 +46,7 @@
+ #include "wine/list.h"
+ 
+ #include "wine/debug.h"
++#include "wine/exception.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(ole);
+ WINE_DECLARE_DEBUG_CHANNEL(accel);
+@@ -645,7 +646,19 @@
+     return DRAGDROP_E_NOTREGISTERED;
+ 
+   drop_target = GetPropW(hwnd, prop_oledroptarget);
+-  if(drop_target) IDropTarget_Release(drop_target);
++  if(drop_target)
++  {
++      /* some applications (e.g. AutoCAD) destroy the drop target before revoking it */
++      __TRY
++      {
++          IDropTarget_Release(drop_target);
++      }
++      __EXCEPT_PAGE_FAULT
++      {
++          WARN("drop target %p for window %p was already destroyed\n", drop_target, hwnd);
++      }
++      __ENDTRY
++  }
+ 
+   RemovePropW(hwnd, prop_oledroptarget);
+   RemovePropW(hwnd, prop_marshalleddroptarget);
+--- a/dlls/urlmon/sec_mgr.c	2026-10-16 19:58:02.578975410 +0200
++++ b/dlls/urlmon/sec_mgr.c	2026-10-16 19:58:02.595975408 +0200
+@@ -449,7 +449,9 @@
+     /* Known hierarchical scheme types must have a host. If they don't Windows
+      * assigns URLZONE_INVALID to the zone.
+      */
+-    if((scheme_type != URL_SCHEME_UNKNOWN && scheme_type != URL_SCHEME_FILE)
++    /* res: URLs carry the module name instead of a host, and applications such
++     * as AutoCAD use res:/// URLs without one; they still get a valid zone. */
++    if((scheme_type != URL_SCHEME_UNKNOWN && scheme_type != URL_SCHEME_FILE && scheme_type != URL_SCHEME_RES)
+         && is_hierarchical_scheme(scheme_type) && !*host) {
+         *zone = URLZONE_INVALID;
+ 

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AutoCAD 2026
+Comment=AutoCAD 2026 in Wine
+Exec=@HOME@/autocad
+Icon=applications-engineering
+Terminal=false
+Categories=Graphics;Engineering;
+StartupWMClass=acad.exe

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Hands adskidmgr:// and adsk.idmgr:// sign-in callbacks from the Linux browser
+# to Autodesk Identity Manager running in the AutoCAD Wine prefix.
+: "${AUTOCAD_WINE_HOME:=$HOME/.cache/wine-autocad-build}"
+case "$1" in
+    adskidmgr:*|adsk.idmgr:*) ;;
+    *) echo "unexpected URL: $1" >&2; exit 1 ;;
+esac
+: "${WINEPREFIX:=$HOME/.wine-autocad}"
+IDM=$(ls -d "$WINEPREFIX/drive_c/Program Files/Autodesk/AdskIdentityManager/"*/ | sort -V | tail -1)
+exec "$AUTOCAD_WINE_HOME/wine-autocad" "C:\\Program Files\\Autodesk\\AdskIdentityManager\\$(basename "$IDM")\\AdskIdentityManager.exe" "$1"

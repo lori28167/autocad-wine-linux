@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Chiudi AutoCAD
+Comment=Chiude forzatamente AutoCAD 2026 (salva prima i disegni)
+Exec=@HOME@/chiudi-autocad
+Icon=process-stop
+Terminal=false

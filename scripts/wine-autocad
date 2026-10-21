@@ -1,0 +1,25 @@
+#!/bin/sh
+# Runs the patched Wine in the AutoCAD prefix.
+# Set AUTOCAD_FAKETIME=1 to run with a Sept 2024 clock (needs libfaketime):
+# the installer packages are signed with an Autodesk certificate that has
+# since expired, and Wine does not honour the signing timestamp.
+: "${AUTOCAD_WINE_HOME:=$HOME/.cache/wine-autocad-build}"
+W="$AUTOCAD_WINE_HOME/wine-custom"
+: "${WINEPREFIX:=$HOME/.wine-autocad}"
+export WINEPREFIX
+export WINESERVER="$W/bin/wineserver"
+# ODIS (the Autodesk installer) loads its DLLs from these folders.
+export WINEPATH='C:\autocad-setup\ODIS\odis.bs.win;C:\autocad-setup\ODIS\odis.bs.wx'
+: "${WINEDEBUG:=-all}"
+export WINEDEBUG
+# Edge WebView2 (Autodesk sign-in panels): recent runtimes need DirectComposition,
+# which Wine lacks, so use the 109 fixed-version runtime (msedgewebview2.exe runs
+# in win7 mode via AppDefaults).
+: "${WEBVIEW2_BROWSER_EXECUTABLE_FOLDER:=C:\\wv2-109}"
+: "${WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:=--no-sandbox}"
+export WEBVIEW2_BROWSER_EXECUTABLE_FOLDER WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+if [ "${AUTOCAD_FAKETIME:-0}" = 1 ]; then
+    export LD_PRELOAD=/usr/lib/faketime/libfaketimeMT.so.1
+    export FAKETIME="@2024-09-20 12:00:00" DONT_FAKE_MONOTONIC=1
+fi
+exec "$W/bin/wine" "$@"
